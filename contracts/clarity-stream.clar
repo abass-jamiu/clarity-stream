@@ -103,3 +103,113 @@
 
     ;; Transfer additional STX to the contract
     (try! (stx-transfer? amount contract-caller (as-contract tx-sender)))
+
+    ;; Update the stream balance atomically
+    (map-set streams stream-id
+      (merge stream { balance: (+ (get balance stream) amount) })
+    )
+    (ok amount)
+  )
+)
+
+;; BALANCE CALCULATION ENGINE
+
+;; Calculate elapsed blocks for accurate payment distribution
+;; This is the mathematical core that ensures precise streaming calculations
+(define-read-only (calculate-block-delta (timeframe {
+  start-block: uint,
+  stop-block: uint,
+}))
+  (let (
+      (start-block (get start-block timeframe))
+      (stop-block (get stop-block timeframe))
+      ;; Smart block delta calculation based on current blockchain state
+      (delta (if (<= stacks-block-height start-block)
+        ;; Stream hasn't started yet
+        u0
+        (if (< stacks-block-height stop-block)
+          ;; Stream is currently active
+          (- stacks-block-height start-block)
+          ;; Stream has completed
+          (- stop-block start-block)
+        )
+      ))
+    )
+    delta
+  )
+)
+
+;; Real-time balance calculation for any stream participant
+;; Returns available balance for withdrawal or refund based on block progression
+(define-read-only (balance-of
+    (stream-id uint)
+    (who principal)
+  )
+  (let (
+      (stream (unwrap! (map-get? streams stream-id) u0))
+      (block-delta (calculate-block-delta (get timeframe stream)))
+      (total-streamed (* block-delta (get payment-per-block stream)))
+    )
+    (if (is-eq who (get recipient stream))
+      ;; Recipient balance: total streamed minus already withdrawn
+      (- total-streamed (get withdrawn-balance stream))
+      (if (is-eq who (get sender stream))
+        ;; Sender balance: locked funds minus total streamed
+        (- (get balance stream) total-streamed)
+        ;; Not a stream participant
+        u0
+      )
+    )
+  )
+)
+
+;; WITHDRAWAL & REFUND MECHANISMS
+
+;; Recipient withdrawal function - claim your streamed STX
+;; Enables recipients to withdraw their earned portion at any time
+(define-public (withdraw (stream-id uint))
+  (let (
+      (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+      (available-balance (balance-of stream-id contract-caller))
+    )
+    ;; Only the designated recipient can withdraw
+    (asserts! (is-eq contract-caller (get recipient stream)) ERR_UNAUTHORIZED)
+    (asserts! (> available-balance u0) ERR_INSUFFICIENT_BALANCE)
+
+    ;; Update withdrawal tracking to prevent double-spending
+    (map-set streams stream-id
+      (merge stream { withdrawn-balance: (+ (get withdrawn-balance stream) available-balance) })
+    )
+
+    ;; Execute the STX transfer to recipient
+    (try! (as-contract (stx-transfer? available-balance tx-sender (get recipient stream))))
+    (ok available-balance)
+  )
+)
+
+;; Sender refund function - reclaim unstreamed STX after completion
+;; Allows senders to recover unused funds once the stream timeframe ends
+(define-public (refund (stream-id uint))
+  (let (
+      (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+      (refund-balance (balance-of stream-id (get sender stream)))
+    )
+    ;; Only the original sender can claim refunds
+    (asserts! (is-eq contract-caller (get sender stream)) ERR_UNAUTHORIZED)
+
+    ;; Stream must be completed before refunds are available
+    (asserts! (>= stacks-block-height (get stop-block (get timeframe stream)))
+      ERR_STREAM_STILL_ACTIVE
+    )
+    (asserts! (> refund-balance u0) ERR_INSUFFICIENT_BALANCE)
+
+    ;; Update stream balance to reflect the refund
+    (map-set streams stream-id
+      (merge stream { balance: (- (get balance stream) refund-balance) })
+    )
+
+    ;; Transfer unused STX back to sender
+    (try! (as-contract (stx-transfer? refund-balance tx-sender (get sender stream))))
+    (ok refund-balance)
+  )
+)
