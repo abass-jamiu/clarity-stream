@@ -213,3 +213,138 @@
     (ok refund-balance)
   )
 )
+
+;; CRYPTOGRAPHIC SECURITY LAYER
+
+;; Generate deterministic hash for stream modification proposals
+;; Creates tamper-proof message hashes for dual-signature verification
+(define-read-only (hash-stream
+    (stream-id uint)
+    (new-payment-per-block uint)
+    (new-timeframe {
+      start-block: uint,
+      stop-block: uint,
+    })
+  )
+  (let (
+      (stream (unwrap! (map-get? streams stream-id) (sha256 0x00)))
+      ;; Concatenate all modification parameters for comprehensive hashing
+      (message-buffer (concat
+        (concat (unwrap-panic (to-consensus-buff? stream))
+          (unwrap-panic (to-consensus-buff? new-payment-per-block))
+        )
+        (unwrap-panic (to-consensus-buff? new-timeframe))
+      ))
+    )
+    (sha256 message-buffer)
+  )
+)
+
+;; Cryptographic signature validation using secp256k1
+;; Ensures both parties consent to stream modifications via Bitcoin-standard signatures
+(define-read-only (validate-signature
+    (message-hash (buff 32))
+    (signature (buff 65))
+    (expected-signer principal)
+  )
+  (is-eq
+    (principal-of? (unwrap! (secp256k1-recover? message-hash signature) false))
+    (ok expected-signer)
+  )
+)
+
+;; STREAM MODIFICATION PROTOCOL
+
+;; Update stream parameters with dual-party cryptographic consent
+;; Enables secure modification of payment rates and timeframes when both
+;; sender and recipient provide cryptographic proof of agreement
+(define-public (update-stream-details
+    (stream-id uint)
+    (new-payment-per-block uint)
+    (new-timeframe {
+      start-block: uint,
+      stop-block: uint,
+    })
+    (counterparty-signature (buff 65))
+  )
+  (let (
+      (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+      (message-hash (hash-stream stream-id new-payment-per-block new-timeframe))
+      ;; Determine who needs to sign based on who initiated the update
+      (required-signer (if (is-eq contract-caller (get sender stream))
+        (get recipient stream)
+        (get sender stream)
+      ))
+    )
+    ;; Verify the counterparty's cryptographic consent
+    (asserts!
+      (validate-signature message-hash counterparty-signature required-signer)
+      ERR_INVALID_SIGNATURE
+    )
+
+    ;; Ensure caller is authorized (either sender or recipient)
+    (asserts!
+      (or
+        (is-eq contract-caller (get sender stream))
+        (is-eq contract-caller (get recipient stream))
+      )
+      ERR_UNAUTHORIZED
+    )
+
+    ;; Validate new timeframe logic
+    (asserts! (< (get start-block new-timeframe) (get stop-block new-timeframe))
+      ERR_INVALID_TIMEFRAME
+    )
+
+    ;; Apply the modifications atomically
+    (map-set streams stream-id
+      (merge stream {
+        payment-per-block: new-payment-per-block,
+        timeframe: new-timeframe,
+      })
+    )
+    (ok true)
+  )
+)
+
+;; UTILITY & QUERY FUNCTIONS
+
+;; Retrieve complete stream information
+;; Public read-only function for transparency and integration
+(define-read-only (get-stream (stream-id uint))
+  (map-get? streams stream-id)
+)
+
+;; Get the current global stream counter
+;; Useful for frontend applications and analytics
+(define-read-only (get-latest-stream-id)
+  (var-get latest-stream-id)
+)
+
+;; Check if a stream is currently active based on block height
+;; Essential for UI/UX and business logic implementations
+(define-read-only (is-stream-active (stream-id uint))
+  (match (map-get? streams stream-id)
+    stream (let (
+        (current-block stacks-block-height)
+        (start (get start-block (get timeframe stream)))
+        (stop (get stop-block (get timeframe stream)))
+      )
+      (and (>= current-block start) (< current-block stop))
+    )
+    false
+  )
+)
+
+;; Calculate total STX that will be streamed over the entire duration
+;; Helps with financial planning and stream analysis
+(define-read-only (get-total-streaming-amount (stream-id uint))
+  (match (map-get? streams stream-id)
+    stream (let ((duration (- (get stop-block (get timeframe stream))
+        (get start-block (get timeframe stream))
+      )))
+      (* duration (get payment-per-block stream))
+    )
+    u0
+  )
+)
